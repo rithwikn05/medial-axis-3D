@@ -42,5 +42,3 @@ The current Delaunay implementation is intentionally simple and testable. The ne
 - Add filtering and simplification to produce a clean medial complex suitable for visualization.
 - Improve test coverage with larger geometry cases and add performance benchmarks.
 - Performance improvements: spatial acceleration structures, incremental caches, and memory layout optimizations.
-
-If you'd like, I can expand any bullet into a concrete implementation plan and start the next item.
