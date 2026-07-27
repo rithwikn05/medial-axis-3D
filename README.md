@@ -11,8 +11,9 @@ The pipeline:
 4. builds a 3D Delaunay tetrahedralization and its interior Voronoi dual;
 5. validates inward Voronoi poles and medial balls;
 6. constructs pole-supported medial sheets;
-7. filters them using local feature size, radius continuity, component
-   support, and 40/80/160-sample cross-resolution stability; and
+7. filters them using local feature size, radius continuity, and component
+   support, while recording 40/80/160-sample cross-resolution stability as a
+   diagnostic; and
 8. displays the result interactively with Polyscope.
 
 This is a practical geometric approximation, not an exact symbolic medial-axis
@@ -41,6 +42,10 @@ cmake --build build --config Release
 ```
 
 Executables are written to `build\Release\` with the Visual Studio generator.
+
+Close a running `polyscope_viewer.exe` before rebuilding it. Windows locks the
+executable while the viewer is open, and MSBuild will otherwise fail with
+`LNK1168: cannot open ... polyscope_viewer.exe for writing`.
 
 ### Linux or macOS
 
@@ -72,9 +77,12 @@ On Linux or macOS:
   --samples 160
 ```
 
-The requested sample resolution is the displayed result. With a valid
-companion `.face` file, the tool also evaluates 40, 80, and 160 samples to
-estimate cross-resolution stability.
+`--samples N` is a minimum, not necessarily the exact displayed sample count.
+The displayed run preserves every original mesh vertex, so a 4,494-vertex mesh
+still uses at least 4,494 samples when invoked with `--samples 160`. With a
+valid companion `.face` file, separate exact 40, 80, and 160-sample runs
+estimate cross-resolution stability. Those coarse runs provide diagnostic
+weights and do not delete geometry by default.
 
 For a faster non-interactive run:
 
@@ -82,8 +90,26 @@ For a faster non-interactive run:
 .\build\Release\polyscope_viewer.exe `
   .\examples\dented_cube.node `
   --samples 160 `
+  --no-cross-resolution `
   --no-gui
 ```
+
+`--no-cross-resolution` is recommended while iterating on geometry. Stability
+is diagnostic-only by default, so disabling its extra runs reduces execution
+time without changing which base-resolution triangles are retained.
+
+For the current fertility model, the recommended interactive iteration command
+is:
+
+```powershell
+.\build\Release\polyscope_viewer.exe `
+  .\data\fertility.node `
+  --samples 160 `
+  --no-cross-resolution
+```
+
+Omit `--no-cross-resolution` when you want the additional stability quantities
+for inspection. The retained base geometry is the same in either mode.
 
 To save a rendering and exit:
 
@@ -208,7 +234,7 @@ polyscope_viewer <input.node> [output.ele] [options]
 | `--min-component-triangles N` | Set the minimum component triangle count. |
 | `--min-component-area-fraction X` | Set the minimum component area fraction from `0` to `1`. |
 | `--min-component-confidence X` | Set the minimum mean confidence from `0` to `1`. |
-| `--min-component-poles N` | Require at least `N` directly supporting validated poles. |
+| `--min-component-poles N` | Require at least `N` directly supporting validated poles. The default is `0` because propagated pole support can validate a neighboring sheet. |
 
 To make the radius-discontinuity weight maximally permissive:
 
@@ -222,8 +248,15 @@ not the medial-sheet triangles. When resampling is enabled, a matching
 
 ## Polyscope controls and layers
 
-The main result is `pole-supported medial sheets`. Useful quantities and
-diagnostic structures include:
+The main orange result is `pole-supported medial sheets`. It contains the
+retained 2D strata. A 3D medial axis is not generally one closed manifold:
+multiple sheets can meet along singular curves, and nearly circular tubular
+parts can collapse toward narrow ribbons or 1D center curves. The disabled
+`medial axis approximation` layer displays the interior Voronoi graph and is
+useful when inspecting those curve-like regions; it is a diagnostic candidate
+graph rather than a fully filtered final axis.
+
+Useful quantities and diagnostic structures include:
 
 - `sheet confidence`
 - `contact angle`
@@ -242,7 +275,8 @@ diagnostic structures include:
 - `restored rejected Voronoi faces`
 - `radius-discontinuity weights`
 - `removed unstable sheet components`
-- `removed resolution-unstable sheets`
+- `removed resolution-unstable sheets` (only populated when destructive
+  stability pruning is explicitly enabled through the library API)
 - `validated medial balls`
 - `contact points` and `contact spokes`
 - `rejected sheet candidates`
@@ -258,17 +292,74 @@ threshold = clamp(0.35 + 0.60 * d / (1 + d), 0.35, 0.85)
 
 Cross-resolution stability matches medial vertices by LFS-normalized position
 and radius, then matches sheet components using overlap, orientation, pole
-support, and topology. Components supported at multiple resolutions retain
-their complete triangulation. The 40, 80, and 160 comparison runs use exact
-downsample counts; the displayed run may contain more points because it
-preserves every original mesh vertex.
+support, and topology. The 40, 80, and 160 comparison runs use exact downsample
+counts, while the displayed run may contain thousands of preserved original
+vertices. Because that resolution mismatch can be very large, stability is a
+diagnostic weight by default. Library callers may explicitly opt into
+destructive component pruning.
 
 Pole support, confidence, and radius continuity are weights rather than
-per-triangle deletion tests. Enclosed gaps are restored as connected patches
-when their radius, orientation, and topology agree. Boundary loops are
+per-triangle deletion tests. Propagated pole support is sufficient by default;
+requiring every sheet stratum to contain a pole's exact source tetrahedron
+incorrectly removes valid neighboring faces. Enclosed gaps are restored as
+connected patches when their radius, orientation, and topology agree.
+
+A Voronoi polygon is treated as one atomic 2-cell. Its arbitrary fan triangles
+receive the same keep/remove decision, preventing a filter from carving
+triangulation-shaped holes through half of a dual face. Boundary loops are
 classified as real terminations, seams/junctions, or unresolved artificial
-boundaries, and cross-resolution instability removes complete sheet
-components instead of isolated triangles.
+boundaries.
+
+## Containment and interpretation
+
+Every retained medial vertex must be inside the closed input surface. In a
+non-convex solid, however, two interior Voronoi vertices can have a straight
+connecting chord that exits and re-enters the object. The implementation
+therefore:
+
+- classifies each candidate circumcenter with the oriented-mesh winding
+  number;
+- tests retained Voronoi edges against the surface triangles;
+- checks polygon boundary edges and fan diagonals for surface crossings; and
+- rejects a complete polygon rather than leaving a partial triangulation.
+
+The startup summary reports both contained and rejected graph edges:
+
+```text
+... 26338 contained Voronoi edges
+    (rejected 0 exterior-crossing edges), ...
+```
+
+On the included `data/fertility` model, the current deterministic
+base-resolution reference run retains 12,271 component-filtered triangles;
+the 40/80/160 stability runs report scores in `[0.25, 1]` and remove zero
+triangles by default. Counts can change when options or input data change.
+
+The implementation still starts from an unconstrained Delaunay
+tetrahedralization and clips/tests its dual against the surface. It is a
+practical approximation, not the same thing as the dual of a constrained
+interior tetrahedralization. Highly pathological, self-intersecting, or nested
+surfaces require stronger input repair or a constrained tetrahedralization.
+
+## Troubleshooting
+
+- **The result is unexpectedly sparse:** ensure you rebuilt and restarted the
+  viewer. Older builds destructively pruned the detailed 4,494-sample result
+  against the fixed 40/80/160 stability runs. The current default records
+  stability without deleting base geometry.
+- **The result appears to cross the transparent surface:** inspect the
+  `rejected ... exterior-crossing edges` count and rotate the view before
+  concluding that a chord is outside; transparency can make depth ambiguous.
+  Also confirm that a matching, valid `.face` file was loaded.
+- **The build fails with `LNK1168`:** close the running viewer and rebuild.
+- **A run is slow:** exact winding and surface-intersection queries scan the
+  input triangles. Use `--no-cross-resolution --no-gui` while iterating, and
+  decimate very large source meshes.
+- **Small open boundaries remain:** a medial axis is a stratified
+  sheet-and-curve complex, so genuine terminations and junction boundaries are
+  possible. Isolated triangle-shaped punctures inside a coherent sheet are not
+  expected; inspect `unresolved artificial sheet boundaries` and the removed
+  component diagnostics.
 
 ## Tests
 
@@ -286,8 +377,10 @@ ctest --test-dir build -C Release --output-on-failure
 ```
 
 The regression suite covers Delaunay construction, explicit surface handling,
-sampling, pole validation, medial-sheet construction, adaptive radius
-filtering, cross-resolution stability, and topology-preserving gap handling.
+sampling, pole validation, medial-sheet construction, non-convex
+segment/surface containment, propagated pole support, atomic dual-face
+retention, diagnostic versus destructive cross-resolution stability, adaptive
+radius filtering, and topology-preserving gap handling.
 
 ## Repository layout
 
