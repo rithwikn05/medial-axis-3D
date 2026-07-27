@@ -1,0 +1,17 @@
+/build/
+/data/
+/out/
+/tmp/
+/.venv/
+/.vs/
+
+.polyscope.ini
+imgui.ini
+viewer_stdout.txt
+viewer_stderr.txt
+
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.user
