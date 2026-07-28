@@ -25,6 +25,12 @@ struct SurfaceSamplingOptions {
     std::size_t target_sample_count{0};
     bool include_mesh_vertices{true};
     bool interpolate_vertex_normals{false};
+    // Optional per-triangle multipliers for distributing generated samples.
+    // The target count remains fixed; values greater than one attract a
+    // larger share of the generated samples and zero suppresses additions on
+    // that triangle. An empty or incorrectly sized vector preserves uniform
+    // area-weighted sampling.
+    std::vector<double> triangle_importance_weights;
 };
 
 namespace detail {
@@ -106,7 +112,11 @@ inline std::vector<SurfaceSample> sample_surface(
     }
 
     std::vector<double> triangle_areas(mesh.faces.size(), 0.0);
+    std::vector<double> allocation_weights(mesh.faces.size(), 0.0);
     double total_area = 0.0;
+    double total_allocation_weight = 0.0;
+    const bool has_importance_weights =
+        options.triangle_importance_weights.size() == mesh.faces.size();
     for (std::size_t face_index = 0; face_index < mesh.faces.size(); ++face_index) {
         const auto& face = mesh.faces[face_index].vertices;
         const Vec3& a = mesh.vertices[static_cast<std::size_t>(face[0])];
@@ -114,9 +124,26 @@ inline std::vector<SurfaceSample> sample_surface(
         const Vec3& c = mesh.vertices[static_cast<std::size_t>(face[2])];
         triangle_areas[face_index] = 0.5 * norm(cross(b - a, c - a));
         total_area += triangle_areas[face_index];
+        double importance = 1.0;
+        if (has_importance_weights) {
+            const double requested_importance =
+                options.triangle_importance_weights[face_index];
+            importance =
+                std::isfinite(requested_importance) &&
+                        requested_importance > 0.0
+                    ? requested_importance
+                    : 0.0;
+        }
+        allocation_weights[face_index] =
+            triangle_areas[face_index] * importance;
+        total_allocation_weight += allocation_weights[face_index];
     }
     if (total_area <= 0.0) {
         return {};
+    }
+    if (total_allocation_weight <= 0.0) {
+        allocation_weights = triangle_areas;
+        total_allocation_weight = total_area;
     }
 
     const std::size_t generated_count = target - samples.size();
@@ -126,7 +153,8 @@ inline std::vector<SurfaceSample> sample_surface(
     for (std::size_t face_index = 0; face_index < mesh.faces.size(); ++face_index) {
         const double exact =
             static_cast<double>(generated_count) *
-            triangle_areas[face_index] / total_area;
+            allocation_weights[face_index] /
+            total_allocation_weight;
         const std::size_t count = static_cast<std::size_t>(std::floor(exact));
         samples_per_face[face_index] = count;
         fractional_remainders[face_index] = exact - static_cast<double>(count);

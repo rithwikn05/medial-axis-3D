@@ -143,9 +143,12 @@ void print_usage(const char* program) {
               << "       [--fixed-radius-jump]\n"
               << "       [--min-contact-angle X]\n"
               << "       [--support-rings N]\n"
+              << "       [--adaptive-sampling]\n"
               << "       [--no-cross-resolution]\n"
               << "If output.ele is supplied, the generated tetrahedra are written in TetGen format.\n"
               << "--samples N generates N deterministic area-weighted surface samples.\n"
+              << "--adaptive-sampling redistributes added samples using a "
+                 "pilot h/LFS estimate.\n"
               << "--no-gui computes and prints geometry statistics without opening Polyscope.\n"
               << "--screenshot renders one image and exits.\n";
 }
@@ -155,6 +158,7 @@ void print_usage(const char* program) {
 int main(int argc, char** argv) {
     bool no_gui = false;
     bool cross_resolution_enabled = true;
+    bool adaptive_sampling_enabled = false;
     std::size_t target_sample_count = 0;
     RadiusContinuityFilterOptions radius_filter_options;
     MedialComponentFilterOptions component_filter_options;
@@ -167,6 +171,8 @@ int main(int argc, char** argv) {
             no_gui = true;
         } else if (argument == "--no-cross-resolution") {
             cross_resolution_enabled = false;
+        } else if (argument == "--adaptive-sampling") {
+            adaptive_sampling_enabled = true;
         } else if (argument == "--fixed-radius-jump") {
             radius_filter_options.use_adaptive_lfs_thresholds = false;
         } else if (argument == "--min-contact-angle") {
@@ -361,6 +367,10 @@ int main(int argc, char** argv) {
         print_usage(argv[0]);
         return 2;
     }
+    if (adaptive_sampling_enabled && target_sample_count == 0) {
+        std::cerr << "--adaptive-sampling requires --samples N.\n";
+        return 2;
+    }
 
     const std::filesystem::path input_path = positional_arguments[0];
     if (input_path.extension() != ".node") {
@@ -397,6 +407,7 @@ int main(int argc, char** argv) {
     std::vector<SurfaceSample> surface_samples;
     std::vector<Vec3> delaunay_points = node_data.points;
     std::vector<Vec3> sample_normals;
+    std::vector<double> adaptive_triangle_importance;
     std::vector<int> output_node_ids = node_data.ids;
     std::vector<int> output_boundary_markers = node_data.boundary_markers;
     int output_index_base = node_data.index_base;
@@ -410,6 +421,98 @@ int main(int argc, char** argv) {
 
         SurfaceSamplingOptions sampling_options;
         sampling_options.target_sample_count = target_sample_count;
+        if (adaptive_sampling_enabled &&
+            target_sample_count > surface_mesh->vertices.size()) {
+            std::cout << "Building an original-vertex pilot estimate for "
+                         "adaptive h/LFS sampling...\n"
+                      << std::flush;
+            SurfaceSamplingOptions pilot_sampling_options;
+            const std::vector<SurfaceSample> pilot_samples =
+                sample_surface(*surface_mesh, pilot_sampling_options);
+            if (pilot_samples.size() < 4) {
+                std::cerr << "Adaptive sampling pilot produced fewer than "
+                             "four points.\n";
+                return 1;
+            }
+
+            std::vector<Vec3> pilot_points;
+            std::vector<Vec3> pilot_normals;
+            pilot_points.reserve(pilot_samples.size());
+            pilot_normals.reserve(pilot_samples.size());
+            for (const SurfaceSample& sample : pilot_samples) {
+                pilot_points.push_back(sample.position);
+                pilot_normals.push_back(sample.normal);
+            }
+
+            Delaunay3 pilot_delaunay;
+            if (!pilot_delaunay.build(pilot_points)) {
+                std::cerr << "Could not tetrahedralize the adaptive sampling "
+                             "pilot points.\n";
+                return 1;
+            }
+            const PoleSelectionResult pilot_poles =
+                select_inward_poles(
+                    pilot_delaunay,
+                    pilot_samples,
+                    *surface_mesh
+                );
+            const SurfaceFeatureField pilot_features =
+                estimate_surface_feature_field(
+                    pilot_points,
+                    pilot_normals,
+                    pilot_poles
+                );
+
+            SurfaceFeatureField vertex_features;
+            vertex_features.sampling_densities.assign(
+                surface_mesh->vertices.size(),
+                1.0
+            );
+            for (std::size_t sample_index = 0;
+                 sample_index < pilot_samples.size();
+                 ++sample_index) {
+                const int source_vertex =
+                    pilot_samples[sample_index].source_vertex;
+                if (source_vertex < 0 ||
+                    static_cast<std::size_t>(source_vertex) >=
+                        vertex_features.sampling_densities.size() ||
+                    sample_index >=
+                        pilot_features.sampling_densities.size()) {
+                    continue;
+                }
+                vertex_features.sampling_densities[
+                    static_cast<std::size_t>(source_vertex)
+                ] = pilot_features.sampling_densities[sample_index];
+            }
+            adaptive_triangle_importance =
+                lfs_adaptive_triangle_importance(
+                    *surface_mesh,
+                    vertex_features
+                );
+            sampling_options.triangle_importance_weights =
+                adaptive_triangle_importance;
+
+            const auto density_range = std::minmax_element(
+                pilot_features.sampling_densities.begin(),
+                pilot_features.sampling_densities.end()
+            );
+            const auto importance_range = std::minmax_element(
+                adaptive_triangle_importance.begin(),
+                adaptive_triangle_importance.end()
+            );
+            std::cout << "Adaptive pilot used "
+                      << pilot_delaunay.point_count()
+                      << " vertices with h/LFS range ["
+                      << *density_range.first << ", "
+                      << *density_range.second
+                      << "]; triangle importance range ["
+                      << *importance_range.first << ", "
+                      << *importance_range.second << "].\n";
+        } else if (adaptive_sampling_enabled) {
+            std::cout << "Adaptive redistribution is inactive because the "
+                         "requested sample count does not exceed the "
+                         "original-vertex count.\n";
+        }
         surface_samples = sample_surface(*surface_mesh, sampling_options);
         if (surface_samples.size() < 4) {
             std::cerr << "Surface resampling did not produce enough points.\n";
@@ -822,6 +925,13 @@ int main(int argc, char** argv) {
             "surface normals",
             to_glm_points(surface_mesh->vertex_normals)
         )->setEnabled(false);
+        if (adaptive_triangle_importance.size() ==
+            surface_mesh->faces.size()) {
+            surface->addFaceScalarQuantity(
+                "adaptive sampling importance",
+                adaptive_triangle_importance
+            )->setEnabled(false);
+        }
     }
 
     auto* samples = polyscope::registerPointCloud("surface samples", sample_points);

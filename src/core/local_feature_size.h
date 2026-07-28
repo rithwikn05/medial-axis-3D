@@ -29,6 +29,14 @@ struct SurfaceFeatureField {
     std::vector<bool> pole_anchored;
 };
 
+struct AdaptiveSamplingWeightOptions {
+    // Squaring h/LFS gives meaningfully more budget to locally undersampled
+    // regions while keeping the redistribution bounded.
+    double density_exponent{2.0};
+    double minimum_triangle_importance{0.25};
+    double maximum_triangle_importance{4.0};
+};
+
 namespace detail {
 
 inline double median_value(std::vector<double> values) {
@@ -267,6 +275,59 @@ inline SurfaceFeatureField estimate_surface_feature_field(
             std::max(result.local_feature_sizes[sample], 1e-12);
     }
     return result;
+}
+
+inline std::vector<double> lfs_adaptive_triangle_importance(
+    const Mesh& mesh,
+    const SurfaceFeatureField& feature_field,
+    const AdaptiveSamplingWeightOptions& options = {}) {
+    std::vector<double> importance(mesh.faces.size(), 1.0);
+    if (feature_field.sampling_densities.size() != mesh.vertices.size() ||
+        !std::isfinite(options.density_exponent) ||
+        options.density_exponent < 0.0 ||
+        !std::isfinite(options.minimum_triangle_importance) ||
+        !std::isfinite(options.maximum_triangle_importance) ||
+        options.minimum_triangle_importance < 0.0 ||
+        options.maximum_triangle_importance <
+            options.minimum_triangle_importance) {
+        return importance;
+    }
+
+    for (std::size_t face_index = 0;
+         face_index < mesh.faces.size();
+         ++face_index) {
+        const auto& face = mesh.faces[face_index].vertices;
+        double maximum_density = 0.0;
+        bool valid_face = true;
+        for (int vertex : face) {
+            if (vertex < 0 ||
+                static_cast<std::size_t>(vertex) >=
+                    feature_field.sampling_densities.size()) {
+                valid_face = false;
+                break;
+            }
+            const double density =
+                feature_field.sampling_densities[
+                    static_cast<std::size_t>(vertex)
+                ];
+            if (!std::isfinite(density) || density < 0.0) {
+                valid_face = false;
+                break;
+            }
+            maximum_density = std::max(maximum_density, density);
+        }
+        if (!valid_face) {
+            continue;
+        }
+        const double weighted_density =
+            std::pow(maximum_density, options.density_exponent);
+        importance[face_index] = std::clamp(
+            weighted_density,
+            options.minimum_triangle_importance,
+            options.maximum_triangle_importance
+        );
+    }
+    return importance;
 }
 
 }  // namespace medial_axis_3d

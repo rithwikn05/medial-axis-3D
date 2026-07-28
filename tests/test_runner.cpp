@@ -263,6 +263,49 @@ int main() {
         }
     ));
 
+    SurfaceSamplingOptions weighted_sampling_options;
+    weighted_sampling_options.target_sample_count = 20;
+    weighted_sampling_options.triangle_importance_weights.assign(
+        tetrahedron_surface.faces.size(),
+        0.0
+    );
+    weighted_sampling_options.triangle_importance_weights[0] = 1.0;
+    const auto weighted_samples =
+        sample_surface(tetrahedron_surface, weighted_sampling_options);
+    assert(weighted_samples.size() == 20);
+    assert(std::all_of(
+        weighted_samples.begin(),
+        weighted_samples.end(),
+        [](const SurfaceSample& sample) {
+            return sample.source_vertex >= 0 ||
+                   sample.source_triangle == 0;
+        }
+    ));
+
+    SurfaceFeatureField adaptive_test_features;
+    adaptive_test_features.sampling_densities.assign(
+        tetrahedron_surface.vertices.size(),
+        0.5
+    );
+    const int adaptive_focus_vertex =
+        tetrahedron_surface.faces[0].vertices[0];
+    adaptive_test_features.sampling_densities[
+        static_cast<std::size_t>(adaptive_focus_vertex)
+    ] = 2.0;
+    const std::vector<double> adaptive_importance =
+        lfs_adaptive_triangle_importance(
+            tetrahedron_surface,
+            adaptive_test_features
+        );
+    assert(adaptive_importance.size() ==
+           tetrahedron_surface.faces.size());
+    assert(adaptive_importance[0] == 4.0);
+    assert(std::count(
+        adaptive_importance.begin(),
+        adaptive_importance.end(),
+        0.25
+    ) == 1);
+
     std::vector<Vec3> sampled_positions;
     std::vector<int> sampled_markers;
     for (const SurfaceSample& sample : sampled_surface) {

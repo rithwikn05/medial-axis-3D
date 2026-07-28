@@ -3,7 +3,7 @@
 `medial-axis-3D` is an experimental C++17 tool for extracting and exploring
 an approximate medial-axis sheet complex inside a closed triangle mesh.
 
-I would like to give credit to Jonathon Shewchuk for his predicates which I used in this approach.
+I would like to give credit to Jonathon Shewchuk for his predicates from Triangle which I used in this approach.
 
 ![Example medial-axis result](example_image.png)
 
@@ -103,6 +103,34 @@ For a faster non-interactive run:
 `--no-cross-resolution` is recommended while iterating on geometry. Stability
 is diagnostic-only by default, so disabling its extra runs reduces execution
 time without changing which base-resolution triangles are retained.
+
+To redistribute a fixed sample budget toward locally undersampled regions,
+enable the deterministic two-pass adaptive sampler:
+
+```powershell
+.\build\Release\polyscope_viewer.exe `
+  .\data\fertility.node `
+  --samples 6000 `
+  --adaptive-sampling `
+  --no-cross-resolution
+```
+
+The pilot pass uses the original surface vertices to estimate local resolution
+`h` and local feature size `LFS`. Added samples are then weighted toward
+triangles with high `h/LFS`, while preserving the requested total sample count
+and every original mesh vertex. The pilot adds runtime, so compare adaptive and
+uniform runs at the same final sample count.
+
+Sampling-convergence experiments can be automated in headless mode:
+
+```powershell
+python .\tools\sampling_convergence.py `
+  .\data\fertility.node `
+  --samples 4494 6000 9000
+```
+
+Add `--adaptive-sampling` to benchmark adaptive allocation. The script writes
+a CSV summary and individual run logs under `build/`.
 
 For the current fertility model, the recommended interactive iteration command
 is:
@@ -231,6 +259,7 @@ polyscope_viewer <input.node> [output.ele] [options]
 | Option | Meaning |
 | --- | --- |
 | `--samples N` | Generate at least `N` deterministic area-weighted surface samples. Original mesh vertices are always preserved. |
+| `--adaptive-sampling` | Use an original-vertex `h/LFS` pilot to redistribute added samples within the fixed `--samples` budget. |
 | `--no-gui` | Run the complete pipeline, print statistics, and exit. |
 | `--screenshot FILE` | Render one image to `FILE` and exit. |
 | `--no-cross-resolution` | Disable the additional 40/80/160 stability runs. |
