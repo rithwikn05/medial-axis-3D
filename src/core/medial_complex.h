@@ -17,7 +17,11 @@
 namespace medial_axis_3d {
 
 struct MedialComplexOptions {
-    double minimum_contact_angle_degrees{90.0};
+    // A weak threshold keeps tapering parts of a medial sheet.  A separate
+    // strong threshold supplies high-confidence seeds.  Using the strong
+    // threshold as a per-polygon deletion test fragments continuous sheets.
+    double minimum_contact_angle_degrees{35.0};
+    double strong_contact_angle_degrees{90.0};
     double minimum_triangle_confidence{0.30};
     double propagated_support_decay{0.70};
     double termination_angle_margin_degrees{15.0};
@@ -449,6 +453,231 @@ struct CandidateGapRepair {
     std::size_t repaired_patch_count{0};
 };
 
+struct CandidatePolygonGapRepair {
+    std::vector<bool> repaired;
+    std::size_t repaired_patch_count{0};
+};
+
+struct CandidatePolygonStratumCompletion {
+    std::vector<bool> repaired;
+    std::size_t completed_stratum_count{0};
+};
+
+inline CandidatePolygonStratumCompletion complete_seeded_polygon_strata(
+    const std::vector<VoronoiFaceCandidate>& faces,
+    const std::vector<bool>& eligible,
+    const std::vector<bool>& inside,
+    std::vector<bool>& keep) {
+    CandidatePolygonStratumCompletion result;
+    result.repaired.assign(faces.size(), false);
+    if (eligible.size() != faces.size() ||
+        inside.size() != faces.size() ||
+        keep.size() != faces.size()) {
+        return result;
+    }
+
+    std::map<ComplexEdge, std::vector<std::size_t>> edge_incidence;
+    for (std::size_t face_index = 0;
+         face_index < faces.size();
+         ++face_index) {
+        if (!eligible[face_index] || !inside[face_index]) {
+            continue;
+        }
+        const auto& sources = faces[face_index].source_tetrahedra;
+        for (std::size_t vertex = 0;
+             vertex < sources.size();
+             ++vertex) {
+            edge_incidence[normalized_complex_edge(
+                sources[vertex],
+                sources[(vertex + 1) % sources.size()]
+            )].push_back(face_index);
+        }
+    }
+
+    // Incidence-two edges continue one ordinary 2D sheet. Incidence-three
+    // or greater edges are medial seams where separate strata meet; do not
+    // flood across them.
+    std::vector<std::vector<std::size_t>> adjacency(faces.size());
+    for (const auto& [edge, incident] : edge_incidence) {
+        (void)edge;
+        if (incident.size() != 2 || incident[0] == incident[1]) {
+            continue;
+        }
+        adjacency[incident[0]].push_back(incident[1]);
+        adjacency[incident[1]].push_back(incident[0]);
+    }
+
+    std::vector<bool> visited(faces.size(), false);
+    for (std::size_t seed = 0; seed < faces.size(); ++seed) {
+        if (visited[seed] || !eligible[seed] || !inside[seed]) {
+            continue;
+        }
+        std::vector<std::size_t> stratum;
+        std::queue<std::size_t> pending;
+        bool has_seed = false;
+        visited[seed] = true;
+        pending.push(seed);
+        while (!pending.empty()) {
+            const std::size_t face_index = pending.front();
+            pending.pop();
+            stratum.push_back(face_index);
+            has_seed = has_seed || keep[face_index];
+            for (std::size_t neighbor : adjacency[face_index]) {
+                if (!visited[neighbor]) {
+                    visited[neighbor] = true;
+                    pending.push(neighbor);
+                }
+            }
+        }
+        if (!has_seed) {
+            continue;
+        }
+        bool repaired_any = false;
+        for (std::size_t face_index : stratum) {
+            if (!keep[face_index]) {
+                keep[face_index] = true;
+                result.repaired[face_index] = true;
+                repaired_any = true;
+            }
+        }
+        if (repaired_any) {
+            ++result.completed_stratum_count;
+        }
+    }
+    return result;
+}
+
+inline CandidatePolygonGapRepair restore_enclosed_polygon_gaps(
+    const std::vector<VoronoiFaceCandidate>& faces,
+    const std::vector<bool>& eligible,
+    const std::vector<bool>& inside,
+    std::vector<bool>& keep) {
+    CandidatePolygonGapRepair result;
+    result.repaired.assign(faces.size(), false);
+    if (eligible.size() != faces.size() ||
+        inside.size() != faces.size() ||
+        keep.size() != faces.size()) {
+        return result;
+    }
+
+    // A Voronoi polygon edge joins two consecutive generating
+    // tetrahedra. Polygons sharing that pair meet along the same geometric
+    // Voronoi edge. Work with these atomic 2-cells so a repair can never
+    // restore only part of an arbitrary fan triangulation.
+    std::map<ComplexEdge, std::vector<std::size_t>> edge_incidence;
+    std::vector<std::vector<ComplexEdge>> polygon_edges(faces.size());
+    for (std::size_t face_index = 0;
+         face_index < faces.size();
+         ++face_index) {
+        if (!eligible[face_index] || !inside[face_index]) {
+            continue;
+        }
+        const auto& sources = faces[face_index].source_tetrahedra;
+        if (sources.size() < 3) {
+            continue;
+        }
+        for (std::size_t vertex = 0;
+             vertex < sources.size();
+             ++vertex) {
+            const ComplexEdge edge = normalized_complex_edge(
+                sources[vertex],
+                sources[(vertex + 1) % sources.size()]
+            );
+            polygon_edges[face_index].push_back(edge);
+            edge_incidence[edge].push_back(face_index);
+        }
+    }
+
+    std::vector<std::vector<std::size_t>> rejected_adjacency(faces.size());
+    for (const auto& [edge, incident] : edge_incidence) {
+        (void)edge;
+        for (std::size_t first = 0; first < incident.size(); ++first) {
+            for (std::size_t second = first + 1;
+                 second < incident.size();
+                 ++second) {
+                const std::size_t a = incident[first];
+                const std::size_t b = incident[second];
+                if (!keep[a] && !keep[b]) {
+                    rejected_adjacency[a].push_back(b);
+                    rejected_adjacency[b].push_back(a);
+                }
+            }
+        }
+    }
+
+    std::vector<bool> visited(faces.size(), false);
+    for (std::size_t seed = 0; seed < faces.size(); ++seed) {
+        if (visited[seed] || keep[seed] ||
+            !eligible[seed] || !inside[seed]) {
+            continue;
+        }
+
+        std::vector<std::size_t> patch;
+        std::queue<std::size_t> pending;
+        visited[seed] = true;
+        pending.push(seed);
+        while (!pending.empty()) {
+            const std::size_t face_index = pending.front();
+            pending.pop();
+            patch.push_back(face_index);
+            for (std::size_t neighbor :
+                 rejected_adjacency[face_index]) {
+                if (!visited[neighbor]) {
+                    visited[neighbor] = true;
+                    pending.push(neighbor);
+                }
+            }
+        }
+
+        const std::set<std::size_t> patch_set(
+            patch.begin(),
+            patch.end()
+        );
+        bool enclosed = !patch.empty();
+        std::size_t retained_boundary_edge_count = 0;
+        for (std::size_t face_index : patch) {
+            for (const ComplexEdge& edge : polygon_edges[face_index]) {
+                const auto found = edge_incidence.find(edge);
+                if (found == edge_incidence.end()) {
+                    enclosed = false;
+                    continue;
+                }
+                bool has_patch_neighbor = false;
+                bool has_retained_neighbor = false;
+                for (std::size_t incident_face : found->second) {
+                    if (incident_face == face_index) {
+                        continue;
+                    }
+                    has_patch_neighbor =
+                        has_patch_neighbor ||
+                        patch_set.count(incident_face) != 0;
+                    has_retained_neighbor =
+                        has_retained_neighbor || keep[incident_face];
+                }
+                if (!has_patch_neighbor) {
+                    if (has_retained_neighbor) {
+                        ++retained_boundary_edge_count;
+                    } else {
+                        // The rejected region reaches the boundary of the
+                        // candidate complex, so this is a legitimate sheet
+                        // termination rather than an enclosed hole.
+                        enclosed = false;
+                    }
+                }
+            }
+        }
+        if (!enclosed || retained_boundary_edge_count < 3) {
+            continue;
+        }
+        for (std::size_t face_index : patch) {
+            keep[face_index] = true;
+            result.repaired[face_index] = true;
+        }
+        ++result.repaired_patch_count;
+    }
+    return result;
+}
+
 inline CandidateGapRepair restore_enclosed_candidate_gaps(
     const MedialComplex& reference,
     std::vector<bool>& keep,
@@ -765,6 +994,47 @@ inline MedialComplex build_validated_medial_complex(
         support.swap(next_support);
     }
 
+    std::vector<bool> polygon_is_inside(faces.size(), false);
+    std::vector<bool> polygon_is_kept(faces.size(), false);
+    for (std::size_t face_index = 0;
+         face_index < faces.size();
+         ++face_index) {
+        if (!geometry_is_eligible[face_index]) {
+            continue;
+        }
+        polygon_is_inside[face_index] =
+            surface_mesh == nullptr ||
+            polygon_fan_inside_mesh(
+                *surface_mesh,
+                faces[face_index].vertices
+            );
+        if (!polygon_is_inside[face_index]) {
+            continue;
+        }
+        const double angle =
+            faces[face_index].contact_angle_degrees;
+        const bool has_strong_medial_evidence =
+            support[face_index] > 0.0 ||
+            angle >= options.strong_contact_angle_degrees;
+        polygon_is_kept[face_index] =
+            has_strong_medial_evidence &&
+            angle >= options.minimum_contact_angle_degrees;
+    }
+    const detail::CandidatePolygonGapRepair polygon_gap_repair =
+        detail::restore_enclosed_polygon_gaps(
+            faces,
+            geometry_is_eligible,
+            polygon_is_inside,
+            polygon_is_kept
+        );
+    const detail::CandidatePolygonStratumCompletion stratum_completion =
+        detail::complete_seeded_polygon_strata(
+            faces,
+            geometry_is_eligible,
+            polygon_is_inside,
+            polygon_is_kept
+        );
+
     Vec3 lower{};
     Vec3 upper{};
     if (!delaunay.points().empty()) {
@@ -969,20 +1239,6 @@ inline MedialComplex build_validated_medial_complex(
 
         const std::size_t triangle_count_before = result.triangles.size();
 
-        // A Voronoi face is the atomic 2-cell of the dual complex. Classify
-        // the polygon once instead of classifying the arbitrary triangles of
-        // its fan independently. Per-triangle classification can retain only
-        // half a face and create triangulation-shaped holes.
-        bool polygon_remains_inside = true;
-        if (surface_mesh != nullptr) {
-            polygon_remains_inside =
-                polygon_fan_inside_mesh(*surface_mesh, face.vertices);
-        }
-        const bool polygon_is_kept =
-            polygon_remains_inside &&
-            face.contact_angle_degrees >=
-                options.minimum_contact_angle_degrees;
-
         for (std::size_t i = 1; i + 1 < polygon.size(); ++i) {
             const std::array<std::size_t, 3> triangle{{
                 polygon[0],
@@ -1008,12 +1264,13 @@ inline MedialComplex build_validated_medial_complex(
             result.triangle_contact_angles.push_back(
                 face.contact_angle_degrees
             );
-            // Contact angle is a geometric mediality condition: accepting
-            // low-angle near-surface bisectors creates the characteristic
-            // inward spikes of the full Voronoi diagram. Pole support,
-            // confidence, and radius continuity remain weights and cannot
-            // independently punch out a face.
-            initially_kept.push_back(polygon_is_kept);
+            // The polygon-level weak/strong decision above is copied to
+            // every fan triangle. Pole support, confidence, and radius
+            // continuity remain weights and cannot independently punch a
+            // triangle-shaped hole through this atomic 2-cell.
+            initially_kept.push_back(
+                polygon_is_kept[face_index]
+            );
             triangle_source_polygons.push_back(face_index);
         }
         (void)triangle_count_before;
@@ -1051,6 +1308,8 @@ inline MedialComplex build_validated_medial_complex(
     retained.rejected_face_confidences.clear();
     retained.topology_restored_candidate_triangles.clear();
     retained.topology_restored_candidate_patch_count =
+        polygon_gap_repair.repaired_patch_count +
+        stratum_completion.completed_stratum_count +
         gap_repair.repaired_patch_count;
     retained.component_count = 0;
 
@@ -1074,8 +1333,21 @@ inline MedialComplex build_validated_medial_complex(
         retained.triangle_radius_jumps.push_back(
             result.triangle_radius_jumps[triangle]
         );
-        if (triangle < gap_repair.repaired.size() &&
-            gap_repair.repaired[triangle]) {
+        const bool polygon_was_repaired =
+            triangle < triangle_source_polygons.size() &&
+            triangle_source_polygons[triangle] <
+                polygon_gap_repair.repaired.size() &&
+            (polygon_gap_repair.repaired[
+                 triangle_source_polygons[triangle]
+             ] ||
+             (triangle_source_polygons[triangle] <
+                  stratum_completion.repaired.size() &&
+              stratum_completion.repaired[
+                  triangle_source_polygons[triangle]
+              ]));
+        if (polygon_was_repaired ||
+            (triangle < gap_repair.repaired.size() &&
+             gap_repair.repaired[triangle])) {
             retained.topology_restored_candidate_triangles.push_back(
                 result.triangles[triangle]
             );

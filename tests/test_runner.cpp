@@ -870,6 +870,77 @@ int main() {
     assert(candidate_gap_repair.repaired[0]);
     assert(candidate_gap_keep[0]);
 
+    std::vector<VoronoiFaceCandidate> polygon_gap_faces(4);
+    polygon_gap_faces[0].source_tetrahedra = {0, 1, 2};
+    polygon_gap_faces[1].source_tetrahedra = {1, 0, 3};
+    polygon_gap_faces[2].source_tetrahedra = {2, 1, 4};
+    polygon_gap_faces[3].source_tetrahedra = {0, 2, 5};
+    const std::vector<bool> polygon_gap_eligible(4, true);
+    const std::vector<bool> polygon_gap_inside(4, true);
+    std::vector<bool> polygon_gap_keep{false, true, true, true};
+    const detail::CandidatePolygonGapRepair polygon_gap_repair =
+        detail::restore_enclosed_polygon_gaps(
+            polygon_gap_faces,
+            polygon_gap_eligible,
+            polygon_gap_inside,
+            polygon_gap_keep
+        );
+    assert(polygon_gap_repair.repaired_patch_count == 1);
+    assert(polygon_gap_repair.repaired[0]);
+    assert(polygon_gap_keep[0]);
+
+    polygon_gap_keep = {false, true, true, false};
+    const detail::CandidatePolygonGapRepair open_polygon_gap =
+        detail::restore_enclosed_polygon_gaps(
+            polygon_gap_faces,
+            polygon_gap_eligible,
+            polygon_gap_inside,
+            polygon_gap_keep
+        );
+    assert(open_polygon_gap.repaired_patch_count == 0);
+    assert(!polygon_gap_keep[0]);
+
+    std::vector<VoronoiFaceCandidate> stratum_faces(3);
+    stratum_faces[0].source_tetrahedra = {0, 1, 2};
+    stratum_faces[1].source_tetrahedra = {1, 0, 3};
+    stratum_faces[2].source_tetrahedra = {0, 3, 4};
+    const std::vector<bool> stratum_eligible(3, true);
+    const std::vector<bool> stratum_inside(3, true);
+    std::vector<bool> stratum_keep{true, false, false};
+    const detail::CandidatePolygonStratumCompletion stratum_completion =
+        detail::complete_seeded_polygon_strata(
+            stratum_faces,
+            stratum_eligible,
+            stratum_inside,
+            stratum_keep
+        );
+    assert(stratum_completion.completed_stratum_count == 1);
+    assert(!stratum_completion.repaired[0]);
+    assert(stratum_completion.repaired[1]);
+    assert(stratum_completion.repaired[2]);
+    assert(std::all_of(
+        stratum_keep.begin(),
+        stratum_keep.end(),
+        [](bool kept) { return kept; }
+    ));
+
+    std::vector<VoronoiFaceCandidate> seam_faces(3);
+    seam_faces[0].source_tetrahedra = {0, 1, 2};
+    seam_faces[1].source_tetrahedra = {1, 0, 3};
+    seam_faces[2].source_tetrahedra = {0, 1, 4};
+    std::vector<bool> seam_keep{true, false, false};
+    const detail::CandidatePolygonStratumCompletion seam_completion =
+        detail::complete_seeded_polygon_strata(
+            seam_faces,
+            stratum_eligible,
+            stratum_inside,
+            seam_keep
+        );
+    assert(seam_completion.completed_stratum_count == 0);
+    assert(seam_keep[0]);
+    assert(!seam_keep[1]);
+    assert(!seam_keep[2]);
+
     MedialComplex termination_loop_complex;
     termination_loop_complex.vertices.assign(
         synthetic_complex.vertices.begin(),
@@ -910,10 +981,19 @@ int main() {
     assert(artificial_boundary_metrics.size() == 1);
     assert(artificial_boundary_metrics[0].artificial_boundary_fraction >
            0.99);
-    const MedialComplexFilterResult artificial_boundary_filtered =
+    const MedialComplexFilterResult diagnostic_boundary_filter =
         filter_medial_complex_components(
             termination_loop_complex,
             boundary_test_poles
+        );
+    assert(diagnostic_boundary_filter.removed_triangles.empty());
+    MedialComponentFilterOptions destructive_boundary_options;
+    destructive_boundary_options.require_valid_sheet_boundaries = true;
+    const MedialComplexFilterResult artificial_boundary_filtered =
+        filter_medial_complex_components(
+            termination_loop_complex,
+            boundary_test_poles,
+            destructive_boundary_options
         );
     assert(artificial_boundary_filtered.retained.triangles.empty());
 

@@ -77,13 +77,18 @@ struct MedialComponentFilterOptions {
     // whether a sheet is persistent.
     std::size_t minimum_triangle_count{1};
     double minimum_area_fraction{0.0};
-    double minimum_mean_confidence{0.30};
+    // Confidence is diagnostic by default. Destructive confidence pruning
+    // can remove a complete stratum after topology completion and reopen
+    // visible gaps.
+    double minimum_mean_confidence{0.0};
     // Propagated support can validate a neighboring stratum even when that
     // stratum does not contain a pole's source tetrahedron. Requiring direct
     // provenance by default cuts supported pieces out of the complex.
     // Callers can still request direct poles explicitly.
     std::size_t minimum_supporting_poles{0};
-    bool require_valid_sheet_boundaries{true};
+    // Boundary classification is likewise diagnostic by default. Callers
+    // may explicitly enable destructive boundary validation.
+    bool require_valid_sheet_boundaries{false};
     // Tiny unresolved loops are commonly caused by floating-point surface
     // classification. Do not discard an otherwise coherent sheet unless the
     // unresolved boundary is a material part of its total boundary.

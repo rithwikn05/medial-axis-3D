@@ -141,6 +141,7 @@ void print_usage(const char* program) {
                  "[--min-component-poles N]\n"
               << "       [--max-relative-radius-jump X]\n"
               << "       [--fixed-radius-jump]\n"
+              << "       [--min-contact-angle X]\n"
               << "       [--support-rings N]\n"
               << "       [--no-cross-resolution]\n"
               << "If output.ele is supplied, the generated tetrahedra are written in TetGen format.\n"
@@ -168,6 +169,32 @@ int main(int argc, char** argv) {
             cross_resolution_enabled = false;
         } else if (argument == "--fixed-radius-jump") {
             radius_filter_options.use_adaptive_lfs_thresholds = false;
+        } else if (argument == "--min-contact-angle") {
+            if (i + 1 >= argc) {
+                print_usage(argv[0]);
+                return 2;
+            }
+            const std::string value = argv[++i];
+            try {
+                std::size_t parsed = 0;
+                medial_complex_options.minimum_contact_angle_degrees =
+                    std::stod(value, &parsed);
+                if (parsed != value.size()) {
+                    throw std::invalid_argument("trailing characters");
+                }
+            } catch (const std::exception&) {
+                std::cerr << argument
+                          << " requires a number from 0 to 180.\n";
+                return 2;
+            }
+            if (!std::isfinite(
+                    medial_complex_options.minimum_contact_angle_degrees) ||
+                medial_complex_options.minimum_contact_angle_degrees < 0.0 ||
+                medial_complex_options.minimum_contact_angle_degrees > 180.0) {
+                std::cerr << argument
+                          << " must be between 0 and 180 degrees.\n";
+                return 2;
+            }
         } else if (argument == "--support-rings") {
             if (i + 1 >= argc) {
                 print_usage(argv[0]);
@@ -635,8 +662,10 @@ int main(int argc, char** argv) {
                   << ", " << *density_range.second << "] using "
                   << anchor_count << " pole-anchored samples.\n";
     }
-    std::cout << "Built " << supported_complex.accepted_polygon_count
-              << " geometrically eligible sheet polygons ("
+    std::cout << "Retained "
+              << supported_complex.accepted_polygon_count << " of "
+              << supported_complex.source_polygon_count
+              << " candidate Voronoi polygons as medial sheets ("
               << supported_complex.triangles.size() << " triangles in "
               << supported_complex.component_count << " component"
               << (supported_complex.component_count == 1 ? "" : "s")
@@ -652,17 +681,21 @@ int main(int argc, char** argv) {
                   ) == 1
                       ? ""
                       : "s")
-              << "; pole evidence is stored as a weight. Restored "
+              << ", weak/strong contact angles "
+              << medial_complex_options.minimum_contact_angle_degrees
+              << "/"
+              << medial_complex_options.strong_contact_angle_degrees
+              << " degrees; pole evidence is stored as a weight. Restored "
               << supported_complex.
                      topology_restored_candidate_triangles.size()
-              << " triangles from "
+              << " triangles across "
               << supported_complex.
                      topology_restored_candidate_patch_count
-              << " enclosed rejected-face patch"
+              << " topology-completed polygon "
               << (supported_complex.
                           topology_restored_candidate_patch_count == 1
-                      ? ""
-                      : "es")
+                      ? "region"
+                      : "regions")
               << ".\n";
     std::cout << "Radius-continuity filtering measured a maximum relative "
                  "jump of "
