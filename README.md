@@ -3,6 +3,8 @@
 `medial-axis-3D` is an experimental C++17 tool for extracting and exploring
 an approximate medial-axis sheet complex inside a closed triangle mesh.
 
+I would like to give credit to Jonathon Shewchuk for his predicates which I used in this approach.
+
 ![Example medial-axis result](example_image.png)
 
 The pipeline:
