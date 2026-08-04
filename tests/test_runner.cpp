@@ -5,6 +5,7 @@
 #include "../src/core/medial_candidate.h"
 #include "../src/core/medial_complex.h"
 #include "../src/core/surface_sample.h"
+#include "../src/core/surface_query_cpu.h"
 #include "../src/core/voronoi_dual.h"
 #include "../src/io/tetgen_io.h"
 
@@ -225,6 +226,72 @@ int main() {
     assert(tetrahedron_surface.vertex_normals.size() == 5);
     assert(point_inside_mesh(tetrahedron_surface, Vec3(0.1, 0.1, 0.1)));
     assert(!point_inside_mesh(tetrahedron_surface, Vec3(2.0, 2.0, 2.0)));
+
+    CpuSurfaceQueryBackend surface_queries(tetrahedron_surface);
+    assert(std::string(surface_queries.name()) == "cpu-reference");
+
+    const std::vector<Vec3> containment_queries = {
+        Vec3(0.1, 0.1, 0.1),
+        Vec3(2.0, 2.0, 2.0)
+    };
+    std::vector<SurfaceQueryClassification> containment_results;
+    surface_queries.points_inside(
+        containment_queries,
+        containment_results
+    );
+    assert(containment_results.size() == containment_queries.size());
+    assert(containment_results[0] == surface_query_true);
+    assert(containment_results[1] == surface_query_false);
+
+    const std::vector<SurfaceSegmentQuery> intersection_queries = {
+        {Vec3(0.1, 0.1, 0.1), Vec3(2.0, 2.0, 2.0)},
+        {Vec3(0.1, 0.1, 0.1), Vec3(0.2, 0.1, 0.1)}
+    };
+    std::vector<SurfaceQueryClassification> intersection_results;
+    surface_queries.segments_intersect(
+        intersection_queries,
+        intersection_results
+    );
+    assert(intersection_results.size() == intersection_queries.size());
+    assert(intersection_results[0] == surface_query_true);
+    assert(intersection_results[1] == surface_query_false);
+
+    const std::vector<NearestSurfaceQuery> contact_queries = {
+        {Vec3(0.1, 0.1, 0.1), 0.0},
+        {Vec3(2.0, 2.0, 2.0), 0.05}
+    };
+    std::vector<std::vector<SurfaceContact>> contact_results;
+    surface_queries.nearest_surface_contacts_batch(
+        contact_queries,
+        contact_results
+    );
+    assert(contact_results.size() == contact_queries.size());
+    for (std::size_t query = 0; query < contact_queries.size(); ++query) {
+        const auto expected_contacts = nearest_surface_contacts(
+            tetrahedron_surface,
+            contact_queries[query].point,
+            contact_queries[query].relative_tolerance
+        );
+        assert(contact_results[query].size() == expected_contacts.size());
+        for (std::size_t contact = 0;
+             contact < expected_contacts.size();
+             ++contact) {
+            assert(contact_results[query][contact].position ==
+                   expected_contacts[contact].position);
+            assert(contact_results[query][contact].normal ==
+                   expected_contacts[contact].normal);
+            assert(contact_results[query][contact].triangle ==
+                   expected_contacts[contact].triangle);
+            assert(contact_results[query][contact].distance ==
+                   expected_contacts[contact].distance);
+        }
+    }
+
+    std::vector<SurfaceQueryClassification> empty_classifications = {
+        surface_query_true
+    };
+    surface_queries.points_inside({}, empty_classifications);
+    assert(empty_classifications.empty());
 
     SurfaceSamplingOptions sampling_options;
     sampling_options.target_sample_count = 20;

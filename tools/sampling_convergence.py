@@ -212,6 +212,11 @@ def main() -> int:
         help="pass --adaptive-sampling to the viewer",
     )
     parser.add_argument(
+        "--profile-stages",
+        action="store_true",
+        help="pass --profile-stages to the viewer and preserve timings in logs",
+    )
+    parser.add_argument(
         "--timeout",
         type=float,
         help="optional timeout in seconds for each run",
@@ -264,6 +269,8 @@ def main() -> int:
             ])
         if arguments.adaptive_sampling:
             command.append("--adaptive-sampling")
+        if arguments.profile_stages:
+            command.append("--profile-stages")
 
         print(f"Running {count} requested samples...", flush=True)
         started = time.perf_counter()

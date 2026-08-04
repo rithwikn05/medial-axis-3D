@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <map>
@@ -43,22 +44,75 @@ struct MedialSheetApproximation {
     std::size_t polygon_count{0};
 };
 
+struct ValidatedMedialComplexProfile {
+    double candidate_generation_seconds{0.0};
+    double point_containment_winding_seconds{0.0};
+    double surface_distance_queries_seconds{0.0};
+    double segment_intersections_seconds{0.0};
+    double pole_support_propagation_seconds{0.0};
+    double topology_completion_seconds{0.0};
+};
+
+namespace detail {
+
+using MedialProfileClock = std::chrono::steady_clock;
+
+inline double medial_profile_elapsed_seconds(
+    const MedialProfileClock::time_point& start) {
+    return std::chrono::duration<double>(
+        MedialProfileClock::now() - start
+    ).count();
+}
+
+}  // namespace detail
+
 inline bool polygon_fan_inside_mesh(
     const Mesh& mesh,
-    const std::vector<Vec3>& polygon) {
+    const std::vector<Vec3>& polygon,
+    ValidatedMedialComplexProfile* profile = nullptr) {
     if (polygon.size() < 3) {
         return false;
     }
 
+    const auto point_is_inside = [&](const Vec3& point) {
+        if (profile == nullptr) {
+            return point_inside_mesh(mesh, point);
+        }
+        const auto start = detail::MedialProfileClock::now();
+        const bool inside = point_inside_mesh(mesh, point);
+        profile->point_containment_winding_seconds +=
+            detail::medial_profile_elapsed_seconds(start);
+        return inside;
+    };
+    const auto segment_intersects = [&](const Vec3& start_point,
+                                        const Vec3& end_point) {
+        if (profile == nullptr) {
+            return segment_intersects_mesh_surface(
+                mesh,
+                start_point,
+                end_point
+            );
+        }
+        const auto start = detail::MedialProfileClock::now();
+        const bool intersects = segment_intersects_mesh_surface(
+            mesh,
+            start_point,
+            end_point
+        );
+        profile->segment_intersections_seconds +=
+            detail::medial_profile_elapsed_seconds(start);
+        return intersects;
+    };
+
     Vec3 center{};
     for (const Vec3& vertex : polygon) {
-        if (!point_inside_mesh(mesh, vertex)) {
+        if (!point_is_inside(vertex)) {
             return false;
         }
         center = center + vertex;
     }
     center = center / static_cast<double>(polygon.size());
-    if (!point_inside_mesh(mesh, center)) {
+    if (!point_is_inside(center)) {
         return false;
     }
 
@@ -66,25 +120,21 @@ inline bool polygon_fan_inside_mesh(
     // fan triangulation. Endpoint tests alone are insufficient in a concave
     // solid: an interior-to-interior chord can cross the exterior twice.
     for (std::size_t vertex = 0; vertex < polygon.size(); ++vertex) {
-        if (segment_intersects_mesh_surface(
-                mesh,
+        if (segment_intersects(
                 polygon[vertex],
                 polygon[(vertex + 1) % polygon.size()])) {
             return false;
         }
     }
     for (std::size_t vertex = 2; vertex + 1 < polygon.size(); ++vertex) {
-        if (segment_intersects_mesh_surface(
-                mesh,
-                polygon[0],
-                polygon[vertex])) {
+        if (segment_intersects(polygon[0], polygon[vertex])) {
             return false;
         }
     }
     for (std::size_t vertex = 1; vertex + 1 < polygon.size(); ++vertex) {
         const Vec3 triangle_center =
             (polygon[0] + polygon[vertex] + polygon[vertex + 1]) / 3.0;
-        if (!point_inside_mesh(mesh, triangle_center)) {
+        if (!point_is_inside(triangle_center)) {
             return false;
         }
     }
@@ -232,8 +282,14 @@ inline MedialAxisApproximation build_medial_axis_approximation(
 
 inline std::vector<VoronoiFaceCandidate> build_interior_voronoi_faces(
     const Delaunay3& delaunay,
-    const Mesh* surface_mesh = nullptr) {
+    const Mesh* surface_mesh = nullptr,
+    ValidatedMedialComplexProfile* profile = nullptr) {
     using Edge = std::array<int, 2>;
+    const auto candidate_start = detail::MedialProfileClock::now();
+    const double containment_before =
+        profile != nullptr
+            ? profile->point_containment_winding_seconds
+            : 0.0;
 
     const auto normalize_edge = [](int first, int second) {
         return first < second ? Edge{first, second} : Edge{second, first};
@@ -305,8 +361,24 @@ inline std::vector<VoronoiFaceCandidate> build_interior_voronoi_faces(
          tetrahedron_index < delaunay.tetrahedron_count();
          ++tetrahedron_index) {
         Vec3 center{};
-        if (delaunay.circumcenter(tetrahedron_index, center) &&
-            point_in_medial_domain(center, delaunay, surface_mesh)) {
+        if (!delaunay.circumcenter(tetrahedron_index, center)) {
+            continue;
+        }
+        bool center_is_inside = false;
+        if (profile != nullptr) {
+            const auto containment_start =
+                detail::MedialProfileClock::now();
+            center_is_inside =
+                point_in_medial_domain(center, delaunay, surface_mesh);
+            profile->point_containment_winding_seconds +=
+                detail::medial_profile_elapsed_seconds(
+                    containment_start
+                );
+        } else {
+            center_is_inside =
+                point_in_medial_domain(center, delaunay, surface_mesh);
+        }
+        if (center_is_inside) {
             circumcenters[tetrahedron_index] = center;
             center_is_interior[tetrahedron_index] = true;
         }
@@ -399,6 +471,15 @@ inline std::vector<VoronoiFaceCandidate> build_interior_voronoi_faces(
         result.push_back(std::move(face));
     }
 
+    if (profile != nullptr) {
+        const double elapsed =
+            detail::medial_profile_elapsed_seconds(candidate_start);
+        const double containment =
+            profile->point_containment_winding_seconds -
+            containment_before;
+        profile->candidate_generation_seconds +=
+            std::max(0.0, elapsed - containment);
+    }
     return result;
 }
 

@@ -26,6 +26,89 @@ sheet terminations, seams, and junctions are expected. Isolated punctures
 inside an otherwise coherent sheet are not expected and are treated as
 topology defects.
 
+## How the algorithm works
+
+The medial axis of a solid is the set of centers of maximal balls contained in
+the solid. In a sampled 3D model, those centers are approximated by vertices of
+the Voronoi diagram of the surface samples. The implementation turns that idea
+into a sheet complex as follows:
+
+1. **Validate and sample the surface.** The companion `.face` mesh is checked
+   for a closed, consistently oriented, two-manifold surface. Original mesh
+   vertices are always preserved, and optional deterministic uniform or
+   adaptive samples are added on its triangles.
+2. **Build the Delaunay/Voronoi structure.** A 3D Delaunay tetrahedralization
+   of the surface samples is constructed with adaptive exact orientation and
+   in-sphere predicates. Each tetrahedron circumcenter is a Voronoi vertex.
+   Circumcenters outside the input solid are discarded using the oriented-mesh
+   winding number.
+3. **Construct candidate Voronoi polygons.** Every eligible Delaunay edge has
+   a dual Voronoi polygon formed by its incident tetrahedron circumcenters.
+   Only polygons with at least three interior vertices are candidates. Polygon
+   boundary edges and fan diagonals are also tested against the surface so a
+   chord between two interior vertices cannot leave and re-enter a concave
+   solid unnoticed.
+4. **Find inward poles and medial balls.** For each surface sample, the
+   algorithm selects an inward Voronoi pole and checks its radius, surface
+   contacts, and normal/contact evidence. Validated poles seed nearby candidate
+   polygons; support is propagated for a small, resolution-scaled number of
+   shared-Voronoi-edge rings.
+5. **Select complete sheet strata.** A candidate polygon is initially selected
+   when it has pole support or strong contact-angle evidence and passes the
+   weak continuation angle. The decision is made for the entire Voronoi
+   polygon, not for individual fan triangles. Rejected polygons enclosed by a
+   retained sheet can be restored, and a seeded two-dimensional stratum is
+   completed across ordinary incidence-two edges. Completion stops at
+   incidence-three-or-greater seams so it does not flood between sheets at a
+   medial junction.
+6. **Measure rather than aggressively delete.** Local feature size, sampling
+   density, medial radius, radius continuity, confidence, component support,
+   and optional cross-resolution stability are attached as diagnostic weights.
+   With the default options these stages do not delete otherwise supported
+   geometry, because per-triangle pruning easily punches holes into a sheet.
+7. **Classify the resulting topology.** Incidence-one edges are grouped into
+   boundary loops and classified as supported sheet terminations, boundaries
+   touching seams or junctions, or unresolved artificial boundaries.
+   Incidence-three-or-greater edges are reported as medial seams, with their
+   endpoints and branches reported as junctions.
+
+The important distinction is that topology repair operates only on Voronoi
+polygons already present in the candidate complex. It can close a rejected
+patch surrounded by retained polygons, but it cannot invent a dual cell that
+candidate construction never produced.
+
+### Why complex models can still contain holes
+
+The current implementation starts from an **unconstrained** Delaunay
+tetrahedralization of surface samples and then keeps/tests its interior
+Voronoi dual. It does not yet build a constrained tetrahedralization of the
+solid or geometrically clip every dual polygon against the input boundary. In
+a simple or nearly convex model, a dual polygon is often wholly inside or
+wholly outside, so this approximation can look clean. In a strongly concave,
+high-genus model such as Fertility, a dual polygon can straddle the surface. If
+fewer than three of its circumcenters remain inside, or if its reconstructed
+fan crosses the surface, the complete polygon is omitted. The resulting gap
+reaches the boundary of the available candidate complex and cannot be safely
+filled by the bounded repair pass.
+
+Resampling has an additional current limitation. Once added samples make the
+Delaunay point set differ from the original surface vertex list, the code does
+not retain a complete triangulated-surface edge map for the new samples and
+falls back to Delaunay convex-hull edges when excluding boundary-edge duals.
+Consequently, changing the sample count can change the candidate definition as
+well as its resolution. A denser result may close a particular gap while also
+introducing extra near-surface or fragmented candidates; it is not proof of
+topological convergence.
+
+These limitations explain why the simple example may have no unresolved holes
+while Fertility still has a few. The robust predicates protect Delaunay
+orientation and in-sphere decisions, and the polygon-level rules prevent the
+filters from creating arbitrary fan-triangle punctures, but those safeguards
+cannot guarantee completeness of the initial medial candidate complex. A
+stronger solution requires preserving surface connectivity during resampling
+and using a constrained interior tetrahedralization, a properly clipped
+restricted Voronoi construction, or a medial-sphere/power-diagram method.
+
 ## Requirements
 
 - CMake 3.16 or newer
@@ -131,6 +214,35 @@ python .\tools\sampling_convergence.py `
 
 Add `--adaptive-sampling` to benchmark adaptive allocation. The script writes
 a CSV summary and individual run logs under `build/`.
+
+To print a stage-by-stage timing breakdown directly in the VS Code terminal,
+add `--profile-stages` to a headless run:
+
+```powershell
+.\build\RelWithDebInfo\polyscope_viewer.exe `
+  .\data\fertility.node `
+  --samples 6000 `
+  --adaptive-sampling `
+  --no-cross-resolution `
+  --no-gui `
+  --profile-stages |
+  Tee-Object .\build\fertility_profile.log
+```
+
+Timing records use the machine-readable form
+`PROFILE stage=<name> seconds=<value>`. Show only those records with:
+
+```powershell
+Select-String `
+  -Path .\build\fertility_profile.log `
+  -Pattern '^PROFILE'
+```
+
+The `validated_medial_complex` record is followed by nested records for
+candidate generation, point containment/winding, surface-distance queries,
+segment intersections, pole-support propagation, and topology completion.
+These nested records partition that parent stage and should not be added to it
+again when computing total runtime.
 
 For the current fertility model, the recommended interactive iteration command
 is:
@@ -260,6 +372,7 @@ polyscope_viewer <input.node> [output.ele] [options]
 | --- | --- |
 | `--samples N` | Generate at least `N` deterministic area-weighted surface samples. Original mesh vertices are always preserved. |
 | `--adaptive-sampling` | Use an original-vertex `h/LFS` pilot to redistribute added samples within the fixed `--samples` budget. |
+| `--profile-stages` | Print machine-readable elapsed time for each major pipeline stage and the total run. |
 | `--no-gui` | Run the complete pipeline, print statistics, and exit. |
 | `--screenshot FILE` | Render one image to `FILE` and exit. |
 | `--no-cross-resolution` | Disable the additional 40/80/160 stability runs. |

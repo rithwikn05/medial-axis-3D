@@ -9,8 +9,10 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -28,6 +30,43 @@
 namespace {
 
 using namespace medial_axis_3d;
+
+void print_profile_record(bool enabled,
+                          const char* name,
+                          double seconds) {
+    if (!enabled) {
+        return;
+    }
+    const std::ios::fmtflags previous_flags = std::cout.flags();
+    const std::streamsize previous_precision = std::cout.precision();
+    std::cout << "PROFILE stage=" << name << " seconds="
+              << std::fixed << std::setprecision(6) << seconds << '\n';
+    std::cout.flags(previous_flags);
+    std::cout.precision(previous_precision);
+}
+
+class StageTimer {
+public:
+    StageTimer(bool enabled, const char* name)
+        : enabled_(enabled),
+          name_(name),
+          start_(std::chrono::steady_clock::now()) {}
+
+    ~StageTimer() {
+        if (!enabled_) {
+            return;
+        }
+        const double seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start_
+        ).count();
+        print_profile_record(true, name_, seconds);
+    }
+
+private:
+    bool enabled_{false};
+    const char* name_{nullptr};
+    std::chrono::steady_clock::time_point start_;
+};
 
 std::vector<glm::vec3> to_glm_points(const std::vector<Vec3>& points) {
     std::vector<glm::vec3> result;
@@ -144,11 +183,14 @@ void print_usage(const char* program) {
               << "       [--min-contact-angle X]\n"
               << "       [--support-rings N]\n"
               << "       [--adaptive-sampling]\n"
+              << "       [--profile-stages]\n"
               << "       [--no-cross-resolution]\n"
               << "If output.ele is supplied, the generated tetrahedra are written in TetGen format.\n"
               << "--samples N generates N deterministic area-weighted surface samples.\n"
               << "--adaptive-sampling redistributes added samples using a "
                  "pilot h/LFS estimate.\n"
+              << "--profile-stages prints machine-readable PROFILE timing "
+                 "lines.\n"
               << "--no-gui computes and prints geometry statistics without opening Polyscope.\n"
               << "--screenshot renders one image and exits.\n";
 }
@@ -159,6 +201,7 @@ int main(int argc, char** argv) {
     bool no_gui = false;
     bool cross_resolution_enabled = true;
     bool adaptive_sampling_enabled = false;
+    bool profile_stages_enabled = false;
     std::size_t target_sample_count = 0;
     RadiusContinuityFilterOptions radius_filter_options;
     MedialComponentFilterOptions component_filter_options;
@@ -173,6 +216,8 @@ int main(int argc, char** argv) {
             cross_resolution_enabled = false;
         } else if (argument == "--adaptive-sampling") {
             adaptive_sampling_enabled = true;
+        } else if (argument == "--profile-stages") {
+            profile_stages_enabled = true;
         } else if (argument == "--fixed-radius-jump") {
             radius_filter_options.use_adaptive_lfs_thresholds = false;
         } else if (argument == "--min-contact-angle") {
@@ -371,6 +416,7 @@ int main(int argc, char** argv) {
         std::cerr << "--adaptive-sampling requires --samples N.\n";
         return 2;
     }
+    StageTimer total_profile(profile_stages_enabled, "total");
 
     const std::filesystem::path input_path = positional_arguments[0];
     if (input_path.extension() != ".node") {
@@ -380,7 +426,12 @@ int main(int argc, char** argv) {
 
     TetGenNodeData node_data;
     std::string error;
-    if (!read_tetgen_node(input_path, node_data, error)) {
+    bool node_loaded = false;
+    {
+        StageTimer profile(profile_stages_enabled, "input_node");
+        node_loaded = read_tetgen_node(input_path, node_data, error);
+    }
+    if (!node_loaded) {
         std::cerr << error << '\n';
         return 1;
     }
@@ -391,8 +442,19 @@ int main(int argc, char** argv) {
     face_path.replace_extension(".face");
     if (std::filesystem::exists(face_path)) {
         TetGenFaceData face_data;
-        if (!read_tetgen_face(face_path, face_data, error) ||
-            !build_surface_mesh(node_data, face_data, explicit_surface, error)) {
+        bool surface_loaded = false;
+        {
+            StageTimer profile(profile_stages_enabled, "input_surface");
+            surface_loaded =
+                read_tetgen_face(face_path, face_data, error) &&
+                build_surface_mesh(
+                    node_data,
+                    face_data,
+                    explicit_surface,
+                    error
+                );
+        }
+        if (!surface_loaded) {
             std::cerr << error << '\n';
             return 1;
         }
@@ -427,8 +489,15 @@ int main(int argc, char** argv) {
                          "adaptive h/LFS sampling...\n"
                       << std::flush;
             SurfaceSamplingOptions pilot_sampling_options;
-            const std::vector<SurfaceSample> pilot_samples =
-                sample_surface(*surface_mesh, pilot_sampling_options);
+            std::vector<SurfaceSample> pilot_samples;
+            {
+                StageTimer profile(
+                    profile_stages_enabled,
+                    "adaptive_pilot_sampling"
+                );
+                pilot_samples =
+                    sample_surface(*surface_mesh, pilot_sampling_options);
+            }
             if (pilot_samples.size() < 4) {
                 std::cerr << "Adaptive sampling pilot produced fewer than "
                              "four points.\n";
@@ -445,23 +514,43 @@ int main(int argc, char** argv) {
             }
 
             Delaunay3 pilot_delaunay;
-            if (!pilot_delaunay.build(pilot_points)) {
+            bool pilot_built = false;
+            {
+                StageTimer profile(
+                    profile_stages_enabled,
+                    "adaptive_pilot_delaunay"
+                );
+                pilot_built = pilot_delaunay.build(pilot_points);
+            }
+            if (!pilot_built) {
                 std::cerr << "Could not tetrahedralize the adaptive sampling "
                              "pilot points.\n";
                 return 1;
             }
-            const PoleSelectionResult pilot_poles =
-                select_inward_poles(
+            PoleSelectionResult pilot_poles;
+            {
+                StageTimer profile(
+                    profile_stages_enabled,
+                    "adaptive_pilot_poles"
+                );
+                pilot_poles = select_inward_poles(
                     pilot_delaunay,
                     pilot_samples,
                     *surface_mesh
                 );
-            const SurfaceFeatureField pilot_features =
-                estimate_surface_feature_field(
+            }
+            SurfaceFeatureField pilot_features;
+            {
+                StageTimer profile(
+                    profile_stages_enabled,
+                    "adaptive_pilot_lfs"
+                );
+                pilot_features = estimate_surface_feature_field(
                     pilot_points,
                     pilot_normals,
                     pilot_poles
                 );
+            }
 
             SurfaceFeatureField vertex_features;
             vertex_features.sampling_densities.assign(
@@ -484,11 +573,17 @@ int main(int argc, char** argv) {
                     static_cast<std::size_t>(source_vertex)
                 ] = pilot_features.sampling_densities[sample_index];
             }
-            adaptive_triangle_importance =
-                lfs_adaptive_triangle_importance(
+            {
+                StageTimer profile(
+                    profile_stages_enabled,
+                    "adaptive_weight_allocation"
+                );
+                adaptive_triangle_importance =
+                    lfs_adaptive_triangle_importance(
                     *surface_mesh,
                     vertex_features
                 );
+            }
             sampling_options.triangle_importance_weights =
                 adaptive_triangle_importance;
 
@@ -513,7 +608,14 @@ int main(int argc, char** argv) {
                          "requested sample count does not exceed the "
                          "original-vertex count.\n";
         }
-        surface_samples = sample_surface(*surface_mesh, sampling_options);
+        {
+            StageTimer profile(
+                profile_stages_enabled,
+                "final_surface_sampling"
+            );
+            surface_samples =
+                sample_surface(*surface_mesh, sampling_options);
+        }
         if (surface_samples.size() < 4) {
             std::cerr << "Surface resampling did not produce enough points.\n";
             return 1;
@@ -542,8 +644,14 @@ int main(int argc, char** argv) {
                   << surface_mesh->faces.size() << " triangles.\n";
     } else if (surface_mesh != nullptr) {
         SurfaceSamplingOptions vertex_sampling_options;
-        surface_samples =
-            sample_surface(*surface_mesh, vertex_sampling_options);
+        {
+            StageTimer profile(
+                profile_stages_enabled,
+                "final_surface_sampling"
+            );
+            surface_samples =
+                sample_surface(*surface_mesh, vertex_sampling_options);
+        }
         if (samples_match_points(surface_samples, node_data.points)) {
             sample_normals.reserve(surface_samples.size());
             for (const SurfaceSample& sample : surface_samples) {
@@ -557,13 +665,19 @@ int main(int argc, char** argv) {
     }
 
     Delaunay3 delaunay;
-    if (!delaunay.build(delaunay_points)) {
+    bool delaunay_built = false;
+    {
+        StageTimer profile(profile_stages_enabled, "final_delaunay");
+        delaunay_built = delaunay.build(delaunay_points);
+    }
+    if (!delaunay_built) {
         std::cerr << "Could not tetrahedralize the input points. "
                   << "Check for duplicates, coplanarity, or severe degeneracy.\n";
         return 1;
     }
 
     if (positional_arguments.size() == 2) {
+        StageTimer profile(profile_stages_enabled, "tetgen_output");
         const std::filesystem::path output_path = positional_arguments[1];
         if (output_path.extension() != ".ele") {
             std::cerr << "Output must use the .ele suffix.\n";
@@ -603,49 +717,101 @@ int main(int argc, char** argv) {
                   << " tetrahedra to " << output_path.string() << ".\n";
     }
 
-    const BoundarySurface reconstructed_boundary =
-        extract_boundary_surface(delaunay);
+    const BoundarySurface reconstructed_boundary = [&]() {
+        StageTimer profile(profile_stages_enabled, "boundary_surface");
+        return extract_boundary_surface(delaunay);
+    }();
     const auto object_faces = surface_mesh != nullptr
         ? to_surface_faces(*surface_mesh)
         : reconstructed_boundary.faces;
-    const MedialAxisApproximation medial =
-        build_medial_axis_approximation(delaunay, surface_mesh);
-    const MedialSheetApproximation sheets =
-        build_medial_sheet_approximation(delaunay, surface_mesh);
+    const MedialAxisApproximation medial = [&]() {
+        StageTimer profile(profile_stages_enabled, "medial_axis");
+        return build_medial_axis_approximation(delaunay, surface_mesh);
+    }();
+    const MedialSheetApproximation sheets = [&]() {
+        StageTimer profile(profile_stages_enabled, "medial_sheets");
+        return build_medial_sheet_approximation(delaunay, surface_mesh);
+    }();
     PoleSelectionResult pole_selection;
-    if (surface_mesh != nullptr &&
-        samples_match_points(surface_samples, delaunay.points())) {
-        pole_selection = select_inward_poles(
-            delaunay,
-            surface_samples,
-            *surface_mesh
-        );
+    {
+        StageTimer profile(profile_stages_enabled, "final_poles");
+        if (surface_mesh != nullptr &&
+            samples_match_points(surface_samples, delaunay.points())) {
+            pole_selection = select_inward_poles(
+                delaunay,
+                surface_samples,
+                *surface_mesh
+            );
+        }
     }
-    const SurfaceFeatureField surface_features =
-        estimate_surface_feature_field(
+    const SurfaceFeatureField surface_features = [&]() {
+        StageTimer profile(profile_stages_enabled, "final_lfs");
+        return estimate_surface_feature_field(
             delaunay.points(),
             sample_normals,
             pole_selection
         );
-    const MedialComplex supported_complex =
-        build_validated_medial_complex(
+    }();
+    ValidatedMedialComplexProfile validated_profile;
+    const MedialComplex supported_complex = [&]() {
+        StageTimer profile(
+            profile_stages_enabled,
+            "validated_medial_complex"
+        );
+        return build_validated_medial_complex(
             delaunay,
             surface_mesh,
             pole_selection,
             medial_complex_options,
-            &surface_features
+            &surface_features,
+            profile_stages_enabled ? &validated_profile : nullptr
         );
-    const RadiusContinuityFilterResult radius_filter =
-        filter_medial_complex_radius_continuity(
+    }();
+    print_profile_record(
+        profile_stages_enabled,
+        "validated_candidate_generation",
+        validated_profile.candidate_generation_seconds
+    );
+    print_profile_record(
+        profile_stages_enabled,
+        "validated_point_containment_winding",
+        validated_profile.point_containment_winding_seconds
+    );
+    print_profile_record(
+        profile_stages_enabled,
+        "validated_surface_distance_queries",
+        validated_profile.surface_distance_queries_seconds
+    );
+    print_profile_record(
+        profile_stages_enabled,
+        "validated_segment_intersections",
+        validated_profile.segment_intersections_seconds
+    );
+    print_profile_record(
+        profile_stages_enabled,
+        "validated_pole_support_propagation",
+        validated_profile.pole_support_propagation_seconds
+    );
+    print_profile_record(
+        profile_stages_enabled,
+        "validated_topology_completion",
+        validated_profile.topology_completion_seconds
+    );
+    const RadiusContinuityFilterResult radius_filter = [&]() {
+        StageTimer profile(profile_stages_enabled, "radius_filter");
+        return filter_medial_complex_radius_continuity(
             supported_complex,
             radius_filter_options
         );
-    const MedialComplexFilterResult component_filter =
-        filter_medial_complex_components(
+    }();
+    const MedialComplexFilterResult component_filter = [&]() {
+        StageTimer profile(profile_stages_enabled, "component_filter");
+        return filter_medial_complex_components(
             radius_filter.retained,
             pole_selection,
             component_filter_options
         );
+    }();
     const MedialComplex& component_filtered_complex =
         component_filter.retained;
 
@@ -657,38 +823,51 @@ int main(int argc, char** argv) {
         component_filter.retained_component_metrics;
     stability_runs.push_back(std::move(base_stability_run));
 
-    if (cross_resolution_enabled &&
-        surface_mesh != nullptr &&
-        target_sample_count > 0) {
-        const std::array<std::size_t, 3> stability_resolutions{
-            40, 80, 160
-        };
-        for (std::size_t resolution : stability_resolutions) {
-            if (resolution == delaunay.point_count()) {
-                continue;
+    {
+        StageTimer profile(
+            profile_stages_enabled,
+            "cross_resolution_runs"
+        );
+        if (cross_resolution_enabled &&
+            surface_mesh != nullptr &&
+            target_sample_count > 0) {
+            const std::array<std::size_t, 3> stability_resolutions{
+                40, 80, 160
+            };
+            for (std::size_t resolution : stability_resolutions) {
+                if (resolution == delaunay.point_count()) {
+                    continue;
+                }
+                ResolutionMedialComplex run;
+                if (!build_resolution_stability_run(
+                        *surface_mesh,
+                        resolution,
+                        medial_complex_options,
+                        radius_filter_options,
+                        component_filter_options,
+                        run,
+                        error)) {
+                    std::cerr << error << '\n';
+                    return 1;
+                }
+                stability_runs.push_back(std::move(run));
             }
-            ResolutionMedialComplex run;
-            if (!build_resolution_stability_run(
-                    *surface_mesh,
-                    resolution,
-                    medial_complex_options,
-                    radius_filter_options,
-                    component_filter_options,
-                    run,
-                    error)) {
-                std::cerr << error << '\n';
-                return 1;
-            }
-            stability_runs.push_back(std::move(run));
         }
     }
-    CrossResolutionStabilityResult stability =
-        analyze_cross_resolution_stability(stability_runs);
-    const TriangularHoleSealResult triangular_hole_seal =
-        seal_isolated_triangular_holes(
+    CrossResolutionStabilityResult stability = [&]() {
+        StageTimer profile(
+            profile_stages_enabled,
+            "cross_resolution_analysis"
+        );
+        return analyze_cross_resolution_stability(stability_runs);
+    }();
+    const TriangularHoleSealResult triangular_hole_seal = [&]() {
+        StageTimer profile(profile_stages_enabled, "triangular_hole_seal");
+        return seal_isolated_triangular_holes(
             supported_complex,
             stability.retained
         );
+    }();
     if (!triangular_hole_seal.restored_triangles.empty()) {
         stability.retained = triangular_hole_seal.sealed;
         for (std::size_t reference_triangle :
@@ -709,7 +888,16 @@ int main(int argc, char** argv) {
     }
     const MedialComplex& validated_complex = stability.retained;
     const std::vector<MedialComponentMetrics> final_component_metrics =
-        analyze_medial_components(validated_complex, pole_selection);
+        [&]() {
+            StageTimer profile(
+                profile_stages_enabled,
+                "final_topology_analysis"
+            );
+            return analyze_medial_components(
+                validated_complex,
+                pole_selection
+            );
+        }();
 
     if (object_faces.empty()) {
         std::cerr << "The tetrahedralization has no boundary surface to display.\n";
@@ -725,6 +913,8 @@ int main(int argc, char** argv) {
     const auto validated_sheet_points =
         to_glm_points(validated_complex.vertices);
 
+    {
+        StageTimer profile(profile_stages_enabled, "console_reporting");
     std::cout << "Loaded " << delaunay.point_count() << " samples, generated "
               << delaunay.tetrahedron_count() << " tetrahedra, "
               << object_faces.size() << " boundary triangles, "
@@ -898,6 +1088,7 @@ int main(int argc, char** argv) {
         std::cout << "No sheet passed the current 110-degree contact-angle filter.\n";
     }
     std::cout << std::flush;
+    }
 
     if (no_gui) {
         return 0;

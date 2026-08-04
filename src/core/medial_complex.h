@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <limits>
@@ -892,14 +893,48 @@ inline MedialComplex build_validated_medial_complex(
     const Mesh* surface_mesh,
     const PoleSelectionResult& pole_selection,
     const MedialComplexOptions& options = {},
-    const SurfaceFeatureField* surface_feature_field = nullptr) {
+    const SurfaceFeatureField* surface_feature_field = nullptr,
+    ValidatedMedialComplexProfile* profile = nullptr) {
+    const auto total_start = detail::MedialProfileClock::now();
+    const ValidatedMedialComplexProfile profile_before =
+        profile != nullptr
+            ? *profile
+            : ValidatedMedialComplexProfile{};
+    const auto finish_profile = [&]() {
+        if (profile == nullptr) {
+            return;
+        }
+        const double accounted =
+            (profile->candidate_generation_seconds -
+             profile_before.candidate_generation_seconds) +
+            (profile->point_containment_winding_seconds -
+             profile_before.point_containment_winding_seconds) +
+            (profile->surface_distance_queries_seconds -
+             profile_before.surface_distance_queries_seconds) +
+            (profile->segment_intersections_seconds -
+             profile_before.segment_intersections_seconds) +
+            (profile->pole_support_propagation_seconds -
+             profile_before.pole_support_propagation_seconds);
+        profile->topology_completion_seconds += std::max(
+            0.0,
+            detail::medial_profile_elapsed_seconds(total_start) -
+                accounted
+        );
+    };
+
     MedialComplex result;
-    const auto faces = build_interior_voronoi_faces(delaunay, surface_mesh);
+    const auto faces = build_interior_voronoi_faces(
+        delaunay,
+        surface_mesh,
+        profile
+    );
     result.source_polygon_count = faces.size();
     if (faces.empty()) {
+        finish_profile();
         return result;
     }
 
+    const auto support_start = detail::MedialProfileClock::now();
     std::vector<double> tetrahedron_support(
         delaunay.tetrahedron_count(),
         0.0
@@ -993,6 +1028,10 @@ inline MedialComplex build_validated_medial_complex(
         }
         support.swap(next_support);
     }
+    if (profile != nullptr) {
+        profile->pole_support_propagation_seconds +=
+            detail::medial_profile_elapsed_seconds(support_start);
+    }
 
     std::vector<bool> polygon_is_inside(faces.size(), false);
     std::vector<bool> polygon_is_kept(faces.size(), false);
@@ -1006,7 +1045,8 @@ inline MedialComplex build_validated_medial_complex(
             surface_mesh == nullptr ||
             polygon_fan_inside_mesh(
                 *surface_mesh,
-                faces[face_index].vertices
+                faces[face_index].vertices,
+                profile
             );
         if (!polygon_is_inside[face_index]) {
             continue;
@@ -1059,8 +1099,26 @@ inline MedialComplex build_validated_medial_complex(
     const auto measure_radius = [&](const Vec3& position,
                                     std::size_t source_tetrahedron) {
         if (surface_mesh != nullptr && !surface_mesh->faces.empty()) {
-            const auto contacts =
-                nearest_surface_contacts(*surface_mesh, position, 0.0);
+            std::vector<SurfaceContact> contacts;
+            if (profile != nullptr) {
+                const auto distance_start =
+                    detail::MedialProfileClock::now();
+                contacts = nearest_surface_contacts(
+                    *surface_mesh,
+                    position,
+                    0.0
+                );
+                profile->surface_distance_queries_seconds +=
+                    detail::medial_profile_elapsed_seconds(
+                        distance_start
+                    );
+            } else {
+                contacts = nearest_surface_contacts(
+                    *surface_mesh,
+                    position,
+                    0.0
+                );
+            }
             if (!contacts.empty()) {
                 return contacts.front().distance;
             }
@@ -1381,6 +1439,7 @@ inline MedialComplex build_validated_medial_complex(
                 options.termination_angle_margin_degrees
         );
     }
+    finish_profile();
     return retained;
 }
 
